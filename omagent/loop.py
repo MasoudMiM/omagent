@@ -36,6 +36,10 @@ class LLM(Protocol):
 # else a human/LLM-readable complaint that is fed into the next fix round.
 Verifier = Callable[[OpResult], Optional[str]]
 
+# A quality gate inspects a whole attempt's diagnostics (warnings included);
+# returns None when the model passes, else a complaint that is fed back.
+WarningGate = Callable[[list[Diagnostic]], Optional[str]]
+
 _MODEL_NAME = re.compile(r"^\s*(?:model|block|package)\s+([A-Za-z_][A-Za-z0-9_]*)",
                          re.MULTILINE)
 
@@ -57,7 +61,7 @@ def extract_model_name(code: str) -> Optional[str]:
 class Attempt:
     n: int
     code: str
-    stage: str                       # "load" | "check" | "simulate" | "verify" | "ok"
+    stage: str   # "load" | "check" | "simulate" | "quality" | "verify" | "ok"
     diagnostics: list[Diagnostic] = field(default_factory=list)
     complaint: Optional[str] = None  # verifier feedback, if any
 
@@ -86,6 +90,7 @@ class AgentLoop:
         max_attempts: int = 4,
         simulate_options: Optional[dict] = None,
         verifier: Optional[Verifier] = None,
+        warning_gate: Optional[WarningGate] = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -94,6 +99,7 @@ class AgentLoop:
         self.max_attempts = max_attempts
         self.simulate_options = simulate_options or {}
         self.verifier = verifier
+        self.warning_gate = warning_gate
 
     def run(self, task: str, model_name: Optional[str] = None) -> LoopResult:
         attempts: list[Attempt] = []
@@ -123,24 +129,36 @@ class AgentLoop:
 
     # -- internals --------------------------------------------------------
     def _try_once(self, n: int, code: str, name: str):
+        all_diags: list[Diagnostic] = []
         res = self.session.load_string(code)
+        all_diags += res.diagnostics
         if not res.success:
-            return Attempt(n, code, "load", res.diagnostics), None
+            return Attempt(n, code, "load", all_diags), None
 
         res = self.session.check_model(name)
+        all_diags += res.diagnostics
         if not res.success:
-            return Attempt(n, code, "check", res.diagnostics), None
+            return Attempt(n, code, "check", all_diags), None
 
         sim = self.session.simulate(name, **self.simulate_options)
+        all_diags += sim.diagnostics
         if not sim.success:
-            return Attempt(n, code, "simulate", sim.diagnostics), None
+            return Attempt(n, code, "simulate", all_diags), None
+
+        # Quality gate first: warnings that indicate sloppy models must be
+        # fixed even when the sim was fine; complaints feed the fix prompt.
+        if self.warning_gate is not None:
+            complaint = self.warning_gate(all_diags)
+            if complaint:
+                att = Attempt(n, code, "quality", all_diags, complaint)
+                return att, sim
 
         if self.verifier is not None:
             complaint = self.verifier(sim)
             if complaint:
-                return Attempt(n, code, "verify", sim.diagnostics, complaint), sim
+                return Attempt(n, code, "verify", all_diags, complaint), sim
 
-        return Attempt(n, code, "ok", sim.diagnostics), sim
+        return Attempt(n, code, "ok", all_diags), sim
 
     def _feedback(self, att: Attempt) -> str:
         parts = [f"Attempt failed at stage '{att.stage}'."]

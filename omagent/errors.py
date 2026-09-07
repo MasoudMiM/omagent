@@ -33,8 +33,10 @@ class Kind(str, Enum):
 
 
 # [/path/File.mo:12:3-14:20:writable] Error: message...
+# omc also emits single positions without an end range: [...:12:3:writable]
 _LOCATED = re.compile(
-    r"^\[(?P<file>[^\]]*?):(?P<l1>\d+):(?P<c1>\d+)-(?P<l2>\d+):(?P<c2>\d+):[^\]]*\]\s*"
+    r"^\[(?P<file>[^\]]*?):(?P<l1>\d+):(?P<c1>\d+)"
+    r"(?:-(?P<l2>\d+):(?P<c2>\d+))?:[^\]]*\]\s*"
     r"(?P<sev>Error|Warning|Notification):\s*(?P<msg>.*)$",
     re.DOTALL,
 )
@@ -153,8 +155,8 @@ def parse_error_string(raw: str) -> list[Diagnostic]:
                 file=m.group("file") or None,
                 line_start=int(m.group("l1")),
                 col_start=int(m.group("c1")),
-                line_end=int(m.group("l2")),
-                col_end=int(m.group("c2")),
+                line_end=int(m.group("l2")) if m.group("l2") else None,
+                col_end=int(m.group("c2")) if m.group("c2") else None,
             ))
             continue
         m = _BARE.match(rec)
@@ -214,13 +216,62 @@ def summarize_for_llm(diags: list[Diagnostic], limit: int = 20) -> str:
     lines: list[str] = []
     for d in errors + warnings:
         b = d.brief()
-        if b not in seen:
-            seen.add(b)
-            lines.append(b)
+        if b in seen:
+            continue
+        seen.add(b)
         if len(lines) >= limit:
-            lines.append(f"... ({len(errors) + len(warnings) - limit} more suppressed)")
             break
+        lines.append(b)
+    suppressed = len(errors) + len(warnings) - len(lines)
+    if suppressed > 0:
+        lines.append(f"... ({suppressed} more suppressed)")
     return "\n".join(lines) if lines else "No errors or warnings."
+
+
+# --------------------------------------------------------- quality gates --
+# Warning-level quality gates: diagnostics omc emits as mere warnings but
+# which indicate real model-quality problems. Matched warnings are surfaced
+# as verifier-style complaints and fed back into the fix loop instead of
+# being ignored for success. Opt-in at the AgentLoop level so benchmark
+# scores stay comparable across versions.
+
+WARNING_GATE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("initial conditions not fully specified", re.compile(
+        r"initial conditions .*not (?:fully )?specified", re.IGNORECASE)),
+    ("over- or inconsistently specified initial conditions", re.compile(
+        r"initial conditions .*(?:over-?specified|conflicting|inconsistent)"
+        r"|conflicting initial conditions", re.IGNORECASE)),
+    ("over/under-determined system", re.compile(
+        r"model (?:is )?(?:over-|under-)determined"
+        r"|(?:over-|under-)determined system", re.IGNORECASE)),
+    ("inconsistent units", re.compile(
+        r"units? (?:mismatch|inconsisten|are not equivalent)"
+        r"|unit (?:mismatch|inconsisten[ct])"
+        r"|units? .*(?:mismatch|inconsisten|equivalen)", re.IGNORECASE)),
+]
+
+DEFAULT_WARNING_GATE = WARNING_GATE_PATTERNS
+
+
+def warning_gate_complaints(
+        diags: list[Diagnostic],
+        rules: list[tuple[str, re.Pattern]] = DEFAULT_WARNING_GATE,
+) -> Optional[str]:
+    """Return a label+message complaint for every gated warning, or None.
+
+    Callables with this shape satisfy the ``omagent.loop.WarningGate``
+    protocol: given the diagnostics of an attempt, return None when the
+    model passes the gate, else a human/LLM-readable complaint.
+    """
+    out: list[str] = []
+    for d in diags:
+        if d.severity != Severity.WARNING:
+            continue
+        for label, pat in rules:
+            if pat.search(d.message):
+                out.append(f"quality: {label}: {d.message.strip()}")
+                break
+    return "; ".join(out) if out else None
 
 
 # Newer OMPython raises OMCSessionException whose message embeds omc's log as
