@@ -39,6 +39,15 @@ def _quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _option_value(v: Any) -> str:
+    """Render a simulate() option as a Modelica literal."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return _quote(v)
+    return str(v)
+
+
 class OMSession:
     """High-level operations over an omc backend."""
 
@@ -112,13 +121,13 @@ class OMSession:
         ok = "completed successfully" in text and not any(
             d.severity == Severity.ERROR for d in diags)
         if not ok and text and "completed successfully" not in text:
-            diags = diags + parse_error_string(text)
+            extra = parse_error_string(text)
+            known = {d.message for d in diags}
+            diags = diags + [d for d in extra if d.message not in known]
         return OpResult("check_model", ok, text, diags)
 
     def simulate(self, model: str, **options: Any) -> OpResult:
-        opts = "".join(
-            f", {k}={_quote(v) if isinstance(v, str) else v}"
-            for k, v in options.items())
+        opts = "".join(f", {k}={_option_value(v)}" for k, v in options.items())
         val, exc_diags = self._safe_send(f"simulate({model}{opts})")
         diags = exc_diags + self._drain_diagnostics()
         messages, result_file = "", ""

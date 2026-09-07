@@ -32,10 +32,12 @@ Key capabilities:
   transcript capture, in the format the OpenModelica benchmark discussion
   ([OpenModelica#15385](https://github.com/OpenModelica/OpenModelica/issues/15385))
   calls for
+- **Multi-run benchmarking** — repeat runs for variance measurement and
+  side-by-side cross-model comparison, aggregated into a single report
 - **LLM-backend-agnostic** — the loop depends on a one-method protocol;
   adapters ship for Anthropic and for any OpenAI-compatible endpoint
   (Ollama, LM Studio, llama.cpp, vLLM — local open-weight models included)
-- **Tested** — 83 unit tests run without OpenModelica installed; 4
+- **Tested** — 101 unit tests run without OpenModelica installed; 4
   integration tests validate against a live omc
 
 ## Installation
@@ -133,6 +135,53 @@ is not, (5) multi-domain electro-mechanical. Per-task JSON transcripts
 (attempt history, diagnostics, code, LLM rounds) land in `transcripts/`,
 with `summary.json` aggregating results.
 
+### Compare models with repeated runs
+
+```python
+from omagent import OMSession, run_comparison
+from omagent.llm import ClaudeLLM, OpenAICompatLLM
+
+comparison = run_comparison(
+    session_factory=OMSession,          # fresh omc session per run
+    llm_factories={
+        "claude-sonnet": lambda: ClaudeLLM(model="claude-sonnet-4-6"),
+        "local-qwen":    lambda: OpenAICompatLLM(model="qwen2.5-coder:14b"),
+    },
+    repeats=3,                          # runs per model for variance
+)
+```
+
+Each (model, task, run) triple runs in isolation, so variance across repeats
+reflects LLM/omc nondeterminism rather than state contamination. Transcripts
+land in `transcripts/<model>/rep<k>/`; `comparison.json` aggregates pass
+rates per model and per task, plus mean/spread of attempts and wall time.
+Use `--tasks`/`--max-tier` equivalents via `task_ids`/`max_tier`, and
+`verbose=True` for progress and a final table.
+
+### Warning-level quality gates
+
+Some omc diagnostics come as warnings yet mean the model is sloppy —
+under/over-specified initial conditions, inconsistent units, over-determined
+systems. Quality gates turn those into verifier-style complaints that feed
+the fix loop, without outright failing the operation:
+
+```python
+from omagent import AgentLoop, OMSession, warning_gate_complaints
+
+loop = AgentLoop(
+    OMSession(), ClaudeLLM(), max_attempts=4,
+    verifier=my_verifier,
+    warning_gate=warning_gate_complaints,   # opt-in; None by default
+)
+```
+
+Gated attempts report stage `"quality"` and the gate complaint is appended
+to the fix prompt's structured feedback. `run_ladder(..., warning_gate=...)`
+threads the gate through the benchmark so scores can be produced under
+either strictness. Custom gates are just callables over
+`list[Diagnostic] -> Optional[str]`; `WARNING_GATE_PATTERNS` is the default
+rule table you can extend.
+
 ### Use pieces standalone
 
 ```python
@@ -159,7 +208,7 @@ omagent/
   tasks.py     # benchmark task ladder definitions
   runner.py    # ladder execution + transcript persistence
 examples/      # first_run.py, run_ladder.py
-tests/         # 83 unit + 4 integration tests
+tests/         # 101 unit + 4 integration tests
 ```
 
 ## Design notes
@@ -176,9 +225,6 @@ tests/         # 83 unit + 4 integration tests
 
 ## Roadmap
 
-- Warning-level quality gates (e.g. treat "initial conditions over
-  specified" as a verifier complaint)
-- Multi-run variance measurement and cross-model comparison in the runner
 - Optional MCP tool surface, composing with OMEdit's built-in MCP server
 - More ladder tiers targeting thermal/fluid domains and third-party libraries
 

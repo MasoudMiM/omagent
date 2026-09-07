@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import pathlib
+import statistics
 import time
 from typing import Callable, Optional
 
-from .loop import AgentLoop, LLM
+from .loop import AgentLoop, LLM, WarningGate
 from .session import OMSession
 from .tasks import get_tasks
 
@@ -23,6 +24,7 @@ def run_ladder(
     max_tier: Optional[int] = None,
     out_dir: str = "transcripts",
     max_attempts: int = 4,
+    warning_gate: Optional[WarningGate] = None,
     verbose: bool = False,
 ) -> dict:
     out = pathlib.Path(out_dir)
@@ -50,7 +52,8 @@ def run_ladder(
             loop = AgentLoop(
                 session, llm, max_attempts=max_attempts,
                 simulate_options=dict(task.simulate_options),
-                verifier=task.verifier)
+                verifier=task.verifier,
+                warning_gate=warning_gate)
             res = loop.run(task.prompt)
             elapsed = time.time() - t0
 
@@ -98,3 +101,91 @@ def run_ladder(
               "total": len(results)}
     (out / "summary.json").write_text(json.dumps(report, indent=2))
     return report
+
+
+def run_comparison(
+    session_factory: Callable[[], OMSession],
+    llm_factories: dict[str, Callable[[], LLM]],
+    task_ids: Optional[list[str]] = None,
+    max_tier: Optional[int] = None,
+    repeats: int = 1,
+    max_attempts: int = 4,
+    out_dir: str = "transcripts",
+    warning_gate: Optional[WarningGate] = None,
+    verbose: bool = False,
+) -> dict:
+    """Run the ladder several times per LLM and compare models.
+
+    Each (model, task, run) triple gets a fresh session and LLM, so runs are
+    fully independent; variance across repeats captures LLM / omc
+    nondeterminism rather than state contamination.
+
+    Transcripts land in ``{out_dir}/{model}/rep{k}/{task}.json``; the
+    aggregated ``comparison.json`` includes per-model pass rates, per-task
+    success counts, and mean/variance of attempts and wall time.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    if not llm_factories:
+        raise ValueError("llm_factories must not be empty")
+
+    tasks = get_tasks(task_ids, max_tier)
+    root = pathlib.Path(out_dir)
+    models: dict[str, dict] = {}
+
+    for name, llm_factory in llm_factories.items():
+        per_task: dict[str, list[dict]] = {t.id: [] for t in tasks}
+        for k in range(1, repeats + 1):
+            run_dir = str(root / name / f"rep{k}")
+            report = run_ladder(
+                session_factory, llm_factory,
+                task_ids=[t.id for t in tasks],
+                out_dir=run_dir, max_attempts=max_attempts,
+                warning_gate=warning_gate,
+                verbose=False)
+            for row in report["results"]:
+                per_task[row["task"]].append(row)
+            if verbose:
+                passed = sum(r["success"] for r in report["results"])
+                print(f"[{name} rep {k}/{repeats}] {passed}/"
+                      f"{len(report['results'])} passed", flush=True)
+
+        task_stats = {}
+        for t in tasks:
+            runs = per_task[t.id]
+            attempts = [r["attempts"] for r in runs]
+            elapsed = [r["elapsed_s"] for r in runs]
+            n = len(runs)
+            task_stats[t.id] = {
+                "tier": t.tier,
+                "runs": n,
+                "passed": sum(r["success"] for r in runs),
+                "pass_rate": sum(r["success"] for r in runs) / n if n else 0.0,
+                "attempts_mean": statistics.fmean(attempts) if n else 0.0,
+                "attempts_stdev": statistics.pstdev(attempts) if n > 1 else 0.0,
+                "elapsed_mean_s": statistics.fmean(elapsed) if n else 0.0,
+                "final_stages": sorted({r["final_stage"] for r in runs}),
+            }
+
+        total = sum(len(runs) for runs in per_task.values())
+        passed = sum(s["passed"] for s in task_stats.values())
+        models[name] = {
+            "total": total,
+            "passed": passed,
+            "pass_rate": passed / total if total else 0.0,
+            "per_task": task_stats,
+        }
+
+    comparison = {"repeats": repeats, "models": models}
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "comparison.json").write_text(json.dumps(comparison, indent=2))
+
+    if verbose:
+        for name, m in models.items():
+            print(f"{name}: {m['passed']}/{m['total']} "
+                  f"({m['pass_rate']:.0%})")
+            for tid, s in m["per_task"].items():
+                print(f"    {tid:<24} {s['passed']}/{s['runs']}"
+                      f"  attempts mean {s['attempts_mean']:.2f}"
+                      f"  {s['elapsed_mean_s']:.1f}s")
+    return comparison
